@@ -7,8 +7,10 @@ This module provides the main integration point for the OpenInference system.
 import logging
 import sys
 import os
-from typing import Dict, Any, Optional, List
+import time
+from typing import Dict, Any, Optional, List, Union, Tuple
 import queue
+import traceback
 
 from .hardware.accelerator import HardwareManager, AcceleratorType
 from .models.registry import ModelRegistry
@@ -106,6 +108,11 @@ class OpenInference:
         try:
             logger.info(f"Loading model: {model_name}")
             
+            # Check if model is already loaded
+            if model_name in self.loaded_models:
+                logger.info(f"Model {model_name} is already loaded")
+                return True
+            
             # Load the model from registry
             model = self.model_registry.load_model(model_name)
             
@@ -151,6 +158,7 @@ class OpenInference:
             
         except Exception as e:
             logger.error(f"Error loading model {model_name}: {str(e)}")
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             return False
     
     def unload_model(self, model_name: str) -> bool:
@@ -170,11 +178,26 @@ class OpenInference:
             
             # Stop continuous batcher if exists
             if model_name in self.continuous_batchers:
-                self.continuous_batchers[model_name].stop()
-                del self.continuous_batchers[model_name]
+                logger.debug(f"Stopping continuous batcher for model {model_name}")
+                try:
+                    self.continuous_batchers[model_name].stop()
+                except Exception as e:
+                    logger.warning(f"Error stopping continuous batcher for model {model_name}: {str(e)}")
+                finally:
+                    del self.continuous_batchers[model_name]
             
             # Remove model from loaded models
-            del self.loaded_models[model_name]
+            model_data = self.loaded_models.pop(model_name)
+            
+            # Attempt to release GPU tensors immediately
+            try:
+                if hasattr(model_data["model"], "to"):
+                    model_data["model"].to("cpu")
+                
+                # Set model to None to help garbage collection
+                model_data["model"] = None
+            except Exception as e:
+                logger.warning(f"Error moving model to CPU: {str(e)}")
             
             # Explicitly trigger garbage collection
             import gc
@@ -189,6 +212,7 @@ class OpenInference:
             
         except Exception as e:
             logger.error(f"Error unloading model {model_name}: {str(e)}")
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             return False
     
     def _is_transformer_model(self, model_name: str) -> bool:
@@ -202,7 +226,8 @@ class OpenInference:
         if hasattr(config, 'model_type'):
             transformer_types = [
                 'gpt', 'llama', 'bert', 'roberta', 't5', 'bart', 
-                'bloom', 'gpt_neox', 'gptj', 'opt', 'falcon'
+                'bloom', 'gpt_neox', 'gptj', 'opt', 'falcon', 'mistral',
+                'mixtral', 'phi', 'mamba'
             ]
             return any(t in config.model_type.lower() for t in transformer_types)
         
@@ -231,8 +256,9 @@ class OpenInference:
             outputs: Model outputs
         """
         if model_name not in self.loaded_models:
-            logger.error(f"Model {model_name} not loaded")
-            return None
+            error_msg = f"Model {model_name} not loaded"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
         
         # Start tracking this request
         request_id = f"req_{model_name}_{str(id(inputs))[-8:]}"
@@ -244,114 +270,28 @@ class OpenInference:
         try:
             # For transformer models with continuous batching and streaming
             if stream and model_name in self.continuous_batchers:
-                tokenizer = self.loaded_models[model_name].get("tokenizer")
-                if not tokenizer:
-                    logger.error(f"Tokenizer not found for model {model_name}, cannot stream.")
-                    self.performance_tracker.finish_request(tracking_info=tracking_info, success=False)
-                    return None
-
-                try:
-                    prompt_token_ids = tokenizer.encode(inputs, add_special_tokens=True)
-                except Exception as e:
-                    logger.error(f"Error tokenizing input for model {model_name}: {str(e)}")
-                    self.performance_tracker.finish_request(tracking_info=tracking_info, success=False)
-                    return None
-
-                token_queue = queue.Queue()
-                
-                # Define the callback for the runtime batcher (receives token IDs)
-                def runtime_batcher_callback(generated_token_ids: List[int], is_done: bool):
-                    # This callback is from the batcher's thread.
-                    # It should put data onto the queue for the main thread's generator.
-                    token_queue.put((generated_token_ids, is_done))
-
-                # Submit generation request
-                # kwargs might include: max_new_tokens, temperature, top_p, top_k, do_sample
-                max_new_tokens = kwargs.get("max_new_tokens", self.loaded_models[model_name]["config"].max_length if hasattr(self.loaded_models[model_name]["config"], 'max_length') else 256)
-                
-                self.continuous_batchers[model_name].submit_request(
-                    prompt_tokens=prompt_token_ids,
-                    max_new_tokens=max_new_tokens,
-                    callback=runtime_batcher_callback,
-                    **kwargs # Pass other generation params like temp, top_p, etc.
+                return self._run_streaming_inference(
+                    model_name=model_name,
+                    inputs=inputs,
+                    tracking_info=tracking_info,
+                    request_id=request_id,
+                    **kwargs
                 )
-                
-                # For streaming, return a generator
-                def result_generator():
-                    all_generated_ids = []
-                    try:
-                        while True:
-                            # Get token IDs with a timeout
-                            chunk_token_ids, is_done = token_queue.get(timeout=kwargs.get("timeout", 120.0))
-                            
-                            if chunk_token_ids: # It seems runtime batcher sends list of new tokens
-                                all_generated_ids.extend(chunk_token_ids)
-                                # Decode only the new chunk to yield
-                                new_text_chunk = tokenizer.decode(chunk_token_ids, skip_special_tokens=True)
-                                if new_text_chunk: # Avoid yielding empty strings if decode results in that
-                                     yield new_text_chunk
-                            
-                            if is_done:
-                                break
-                    except queue.Empty:
-                        logger.warning(f"Timeout waiting for token stream from runtime batcher for request {request_id}")
-                    except Exception as e:
-                        logger.error(f"Error in stream generator for request {request_id} with runtime batcher: {e}", exc_info=True)
-                    finally:
-                        # Ensure performance tracking is finished
-                        self.performance_tracker.finish_request(
-                            tracking_info=tracking_info,
-                            success=True # TODO: Add more nuanced success tracking if possible
-                        )
-                
-                return result_generator()
             
             # For standard models using dynamic batching or non-streaming LLM inference
             else:
-                # Get model and required components
-                model = self.loaded_models[model_name]["model"]
-                
-                # Prepare compute function
-                def compute_fn(batch_inputs):
-                    # Record computation start time
-                    compute_start = time.time()
-                    
-                    # Move inputs to device if needed
-                    if hasattr(batch_inputs, 'to') and hasattr(model, 'device'):
-                        batch_inputs = batch_inputs.to(model.device)
-                    
-                    # Run inference
-                    with torch.no_grad():
-                        outputs = model(batch_inputs, **kwargs)
-                    
-                    # Record completion
-                    input_shape = list(batch_inputs.shape) if hasattr(batch_inputs, 'shape') else None
-                    output_shape = list(outputs.shape) if hasattr(outputs, 'shape') else None
-                    
-                    self.performance_tracker.finish_request(
-                        tracking_info=tracking_info,
-                        batch_size=batch_inputs.shape[0] if hasattr(batch_inputs, 'shape') and len(batch_inputs.shape) > 0 else 1,
-                        input_shape=input_shape,
-                        output_shape=output_shape,
-                        compute_start_time=compute_start,
-                        success=True
-                    )
-                    
-                    return outputs
-                
-                # Use dynamic batcher if enabled and batching makes sense
-                if batch_size and batch_size > 1:
-                    return self.dynamic_batcher.process(
-                        inputs=inputs,
-                        compute_fn=compute_fn,
-                        batch_size=batch_size
-                    )
-                else:
-                    # Direct computation without batching
-                    return compute_fn(inputs)
+                return self._run_standard_inference(
+                    model_name=model_name,
+                    inputs=inputs,
+                    batch_size=batch_size,
+                    tracking_info=tracking_info,
+                    **kwargs
+                )
                 
         except Exception as e:
-            logger.error(f"Inference error with model {model_name}: {str(e)}")
+            error_msg = f"Inference error with model {model_name}: {str(e)}"
+            logger.error(error_msg)
+            logger.debug(f"Traceback: {traceback.format_exc()}")
             
             # Record failure
             self.performance_tracker.finish_request(
@@ -359,7 +299,134 @@ class OpenInference:
                 success=False
             )
             
-            return None
+            # Re-raise with detailed error
+            raise RuntimeError(f"{error_msg}. Full traceback available in debug logs.")
+    
+    def _run_streaming_inference(self, 
+                               model_name: str, 
+                               inputs: Any, 
+                               tracking_info: Dict[str, Any],
+                               request_id: str,
+                               **kwargs) -> Any:
+        """Run streaming inference with a model."""
+        tokenizer = self.loaded_models[model_name].get("tokenizer")
+        if not tokenizer:
+            error_msg = f"Tokenizer not found for model {model_name}, cannot stream."
+            logger.error(error_msg)
+            self.performance_tracker.finish_request(tracking_info=tracking_info, success=False)
+            raise ValueError(error_msg)
+
+        try:
+            prompt_token_ids = tokenizer.encode(inputs, add_special_tokens=True)
+        except Exception as e:
+            error_msg = f"Error tokenizing input for model {model_name}: {str(e)}"
+            logger.error(error_msg)
+            self.performance_tracker.finish_request(tracking_info=tracking_info, success=False)
+            raise ValueError(error_msg)
+
+        token_queue = queue.Queue()
+        
+        # Define the callback for the runtime batcher (receives token IDs)
+        def runtime_batcher_callback(generated_token_ids: List[int], is_done: bool):
+            # This callback is from the batcher's thread.
+            # It should put data onto the queue for the main thread's generator.
+            token_queue.put((generated_token_ids, is_done))
+
+        # Submit generation request
+        # kwargs might include: max_new_tokens, temperature, top_p, top_k, do_sample
+        max_new_tokens = kwargs.get(
+            "max_new_tokens", 
+            self.loaded_models[model_name]["config"].max_length if hasattr(self.loaded_models[model_name]["config"], 'max_length') else 256
+        )
+        
+        self.continuous_batchers[model_name].submit_request(
+            prompt_tokens=prompt_token_ids,
+            max_new_tokens=max_new_tokens,
+            callback=runtime_batcher_callback,
+            **kwargs # Pass other generation params like temp, top_p, etc.
+        )
+        
+        # For streaming, return a generator
+        def result_generator():
+            all_generated_ids = []
+            try:
+                while True:
+                    # Get token IDs with a timeout
+                    chunk_token_ids, is_done = token_queue.get(timeout=kwargs.get("timeout", 120.0))
+                    
+                    if chunk_token_ids: # It seems runtime batcher sends list of new tokens
+                        all_generated_ids.extend(chunk_token_ids)
+                        # Decode only the new chunk to yield
+                        new_text_chunk = tokenizer.decode(chunk_token_ids, skip_special_tokens=True)
+                        if new_text_chunk: # Avoid yielding empty strings if decode results in that
+                             yield new_text_chunk
+                    
+                    if is_done:
+                        break
+            except queue.Empty:
+                logger.warning(f"Timeout waiting for token stream from runtime batcher for request {request_id}")
+                yield "\n[Generation timed out]"
+            except Exception as e:
+                error_msg = f"Error in stream generator for request {request_id}: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                yield f"\n[Error during generation: {str(e)}]"
+            finally:
+                # Ensure performance tracking is finished
+                self.performance_tracker.finish_request(
+                    tracking_info=tracking_info,
+                    success=True # TODO: Add more nuanced success tracking if possible
+                )
+        
+        return result_generator()
+    
+    def _run_standard_inference(self,
+                              model_name: str,
+                              inputs: Any,
+                              batch_size: Optional[int],
+                              tracking_info: Dict[str, Any],
+                              **kwargs) -> Any:
+        """Run standard (non-streaming) inference with a model."""
+        # Get model and required components
+        model = self.loaded_models[model_name]["model"]
+        
+        # Prepare compute function
+        def compute_fn(batch_inputs):
+            # Record computation start time
+            compute_start = time.time()
+            
+            # Move inputs to device if needed
+            if hasattr(batch_inputs, 'to') and hasattr(model, 'device'):
+                batch_inputs = batch_inputs.to(model.device)
+            
+            # Run inference
+            with torch.no_grad():
+                outputs = model(batch_inputs, **kwargs)
+            
+            # Record completion
+            input_shape = list(batch_inputs.shape) if hasattr(batch_inputs, 'shape') else None
+            output_shape = list(outputs.shape) if hasattr(outputs, 'shape') else None
+            
+            self.performance_tracker.finish_request(
+                tracking_info=tracking_info,
+                batch_size=batch_inputs.shape[0] if hasattr(batch_inputs, 'shape') and len(batch_inputs.shape) > 0 else 1,
+                input_shape=input_shape,
+                output_shape=output_shape,
+                compute_start_time=compute_start,
+                success=True
+            )
+            
+            return outputs
+        
+        # Use dynamic batcher if enabled and batching makes sense
+        if batch_size and batch_size > 1:
+            return self.dynamic_batcher.process(
+                inputs=inputs,
+                compute_fn=compute_fn,
+                batch_size=batch_size
+            )
+        else:
+            # Direct computation without batching
+            return compute_fn(inputs)
     
     def get_performance_metrics(self) -> Dict[str, Any]:
         """Get system performance metrics."""
@@ -410,19 +477,37 @@ class OpenInference:
     
     def shutdown(self):
         """Shutdown the inference system."""
+        logger.info("Shutting down OpenInference system")
+        
         # Stop all continuous batchers
         for model_name, batcher in list(self.continuous_batchers.items()):
-            batcher.stop()
+            try:
+                logger.debug(f"Stopping continuous batcher for model {model_name}")
+                batcher.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping continuous batcher for {model_name}: {str(e)}")
         
         # Unload all models
         for model_name in list(self.loaded_models.keys()):
-            self.unload_model(model_name)
+            try:
+                logger.debug(f"Unloading model {model_name}")
+                self.unload_model(model_name)
+            except Exception as e:
+                logger.warning(f"Error unloading model {model_name}: {str(e)}")
         
         # Stop performance tracker
-        self.performance_tracker.stop()
+        try:
+            logger.debug("Stopping performance tracker")
+            self.performance_tracker.stop()
+        except Exception as e:
+            logger.warning(f"Error stopping performance tracker: {str(e)}")
         
         # Clear memory
-        self.memory_manager.clear_all()
-        self.kv_cache_manager.clear_all()
+        try:
+            logger.debug("Clearing memory")
+            self.memory_manager.clear_all()
+            self.kv_cache_manager.clear_all()
+        except Exception as e:
+            logger.warning(f"Error clearing memory: {str(e)}")
         
         logger.info("OpenInference system shutdown complete")
